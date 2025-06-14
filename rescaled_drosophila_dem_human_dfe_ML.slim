@@ -1,0 +1,165 @@
+// Run this script as follows:
+// slim -d model=<model_number> -d seed=<seed> -d out_path=<out_path> -d sim_annots=<path_to_sim_annots> drosophila_dem_human_dfe_ML.slim
+
+initialize() {
+	initializeSLiMOptions(keepPedigrees=F);
+
+	// command line constants
+	setSeed(seed);
+
+	// print model and seed
+	catn("Model: " + model);
+	catn("Seed: " + seed);
+
+	// see Meixi's supplemental Excel file
+	// (Multiply by factor of 100: 1.5e-9 -> 1.5e-7)
+	initializeMutationRate(1.5e-7);
+
+	// Average recombination rates for Drosophila chromosomes 2L, 2R, 3L, and 3R (from stdpopsim catalog)
+	// (Multiply by factor of 100: 2.03806e-8 -> 2.03806e-6)
+	initializeRecombinationRate(2.03806e-6);
+
+	// draw deleterious mutations from Lin et al. 2024 DFE
+	// Bernard used a mutation rate of 1.5E-8 and I used 2.5E-8, therefore the average effect is different
+	// shape = 0.189, scale = 1027, Nanc = 7041; Es_SLiM = (-2*shape*scale)/(2*Nanc) = Es_dadi*2
+	// Multiply by factor of 100 : shape parameter (alpha) remains unchanged, while the scale parameter 
+	// is adjusted accordingly, which alters the mean -0.02762939 * 100 = -2.762939
+	initializeMutationType("m1", 0.5, "g", -2.762939, 0.189);
+
+	// neutral mutations - a separate type for each genomic element type to calculate sfs
+	initializeMutationType("m2", 0.5, "f", 0.0);
+	initializeMutationType("m3", 0.5, "f", 0.0);
+
+	// coding regions
+	// ratio of different deleterious mutation types taken from Huber 2017 DFE (sum to 100 below)
+	// assume ratio of deleterious to neutral muts of 2.85:1
+	// giving 100/2.85=35.1 for neutral mutations below
+	initializeGenomicElementType("g1", c(m1, m2), c(100, 35.1));
+
+	// non-coding regions
+	if (model == '1') {
+		initializeGenomicElementType("g2", c(m3), 1); // background non-coding with neutral only
+	} else {
+		stop(paste("Invalid model:", model));
+	}
+
+	// create chromosome
+	annots = readCSV(sim_annots);	
+	for (row in 0:(annots.nrow - 1)) {
+		start = annots.subset(row, 'start');
+		end = annots.subset(row, 'end');
+		elem_type = annots.subset(row, 'type');
+		if (elem_type == 'exon') {
+			initializeGenomicElement(g1, start, end);
+		} else if (elem_type == 'bkgd') {
+			initializeGenomicElement(g2, start, end);
+		}
+	}
+
+}
+
+/// Demography:
+/// parameters here taken Meixi et. al (2024) two-epoch model
+/// parameters scaled in terms of diploids and generations
+/// ancestral population size 2766461.147 (rounded to 2766461)
+/// Divide by factor of 100: 2766461.147 -> 27664.61147 (rounded to 27,665)
+1 early() {
+	sim.addSubpop("p1", 27665);
+	cat("gen,popSize" + "\n");
+
+	// Set up log files, every 1000 cycles, should be around total of 281 entries in the full timeline
+        log_stats_filePath = paste0(log_path, "/", "stats_", run, ".txt");
+        defineConstant("log", community.createLogFile(log_stats_filePath, sep="\t", logInterval = 1000));
+        log.addCycle();
+        log.addSubpopulationSize(p1);
+        log.addCustomColumn('mean_fitness het_exp het_obs het_m1 het_m2 s_1000', 'getStats(p1);');
+}
+
+// Keep track of generation number and peak memory usage (since script started) 
+// in log file every 1,000 generations (append itself).
+1:281727 early(){
+	   if (sim.cycle % 1000 == 0){
+	      mem = usage(type = "rss_peak");
+	      log_memory_file_content = paste(c(date(),time()," current generation:", sim.cycle," peak memory usage (in Mb):", mem));
+	      writeFile(paste0(log_path, "/", "log_", run, ".txt"), log_memory_file_content, append = T);
+	   }
+}
+
+// population growth to 7482089.996 (rounded to 7482090)
+/// Divide by factor of 100: 7482089.996 -> 74820.89996 (rounded to 74,821)
+/// Burn-in still 10*N_anc ~ 276650
+276650 early() {
+	p1.setSubpopulationSize(74821);
+}
+
+// population growth to 7482090 for 507689.1021 (rounded to 507689) generations
+// end simulation
+/// Divide by factor of 100: 507689.1021 -> 5076.891021 (rounded to 5077)
+281727 early() {
+	// sim.simulationFinished();
+	
+	// force log output
+        log.logRow();
+        community.simulationFinished();
+}
+
+// output sfs
+281727 late() {
+       
+	vcf_filePath = paste0(out_path, "/", "output_", run, ".vcf");
+       	p1.outputVCFSample(sampleSize = 200, filePath = vcf_filePath); 
+
+	sample_sizes = c(10, 100, 400);
+
+	for (ss in sample_sizes) {
+
+		genomes = sample(p1.genomes, ss);
+
+		m1_muts = unique(genomes.mutationsOfType(m1));
+		m1_counts = genomes.mutationCountsInGenomes(mutations=m1_muts);
+		m2_muts = unique(genomes.mutationsOfType(m2));
+		m2_counts = genomes.mutationCountsInGenomes(mutations=m2_muts);
+		m3_muts = unique(genomes.mutationsOfType(m3));
+		m3_counts = genomes.mutationCountsInGenomes(mutations=m3_muts);
+
+		m1_sfs = c();
+		m2_sfs = c();
+		m3_sfs = c();
+
+		for (i in 1:ss) {
+			m1_sfs = c(m1_sfs, sum(m1_counts==i));
+			m2_sfs = c(m2_sfs, sum(m2_counts==i));
+			m3_sfs = c(m3_sfs, sum(m3_counts==i));
+		}
+
+		file_content = "m" + 1 + "_" + ss + "_ss\n" + paste(m1_sfs, sep="\n");
+		writeFile(paste0(out_path, "/", "sfs_" + "m" + 1 + "_", "sim_", run, "_", ss, "_ss.csv"), file_content);
+
+		file_content = "m" + 2 + "_" + ss + "_ss\n" + paste(m2_sfs, sep="\n");
+		writeFile(paste0(out_path, "/", "sfs_" + "m" + 2 + "_", "sim_", run, "_", ss, "_ss.csv"), file_content);
+
+		file_content = "m" + 3 + "_" + ss + "_ss\n" + paste(m3_sfs, sep="\n");
+		writeFile(paste0(out_path, "/", "sfs_" + "m" + 3 + "_", "sim_", run, "_", ss, "_ss.csv"), file_content);
+
+	}
+
+}
+
+function (string) getStats(o pop) {
+	 
+        inds = pop.sampleIndividuals(100);
+        mean_fitness = mean(pop.cachedFitness(NULL));
+        muts_m1 = unique(inds.uniqueMutationsOfType(m1));
+        muts_m2 = unique(inds.uniqueMutationsOfType(m2));
+        s = muts_m1.selectionCoeff;
+        if (length(s) > 1000)
+                s = sample(s, 1000);
+        het_exp = calcHeterozygosity(inds.genomes);
+        het_obs = mean(sapply(inds, 'calcPairHeterozygosity(applyValue.genome1,applyValue.genome2);'));
+        // Only able to calculate expected het with mutation subsetting, settle for now.
+        het_m1 = calcHeterozygosity(inds.genomes, muts = muts_m1);
+        het_m2 = calcHeterozygosity(inds.genomes, muts = muts_m2);
+        output = paste(mean_fitness, het_exp, het_obs, het_m1, het_m2, paste(s, sep = '|'));
+        return(output);
+}     
+
